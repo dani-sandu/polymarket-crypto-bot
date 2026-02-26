@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "core-shared",
+    "btc-5min-bot",
+    "eth-5min-bot"
+]
+resolver = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = 'abort'
+opt-level = 3
+strip = true
