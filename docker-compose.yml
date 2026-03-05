@@ -1,1 +1,9 @@
-version: '3.8'\nservices:\n  crypto-bot:\n    build: .\n    env_file: /app/config/.env\n    volumes:\n      - ./config:/app/config\n    environment:\n      - PRIVATE_KEY=${PRIVATE_KEY}\n      - POLYGON_RPC_URL=${POLYGON_RPC_URL}\n      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}\n      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}\n      - TRADING_ENABLED=${TRADING_ENABLED}\n    ports: []\n
+version: '3.8'
+
+services:
+  crypto-bot:
+    build: .
+    volumes:
+      - ./config:/app/config
+    env_file:
+      - ./config/.env
