@@ -514,6 +514,18 @@ async fn main() {
                 println!("[AUTH] Polymarket SDK Authenticated.");
             }
         }
+
+        let trading_addr = funder_address.unwrap_or_else(|| {
+            env::var("PRIVATE_KEY").ok()
+                .and_then(|k| k.trim().parse::<LocalWallet>().ok())
+                .map(|w| w.address())
+                .unwrap_or_default()
+        });
+        let startup_msg = format!(
+            "🚀 Bot Started!\nAsset: {}\nAddress: {:?}\nBalance: ${:.2}",
+            market_asset.to_uppercase(), trading_addr, initial_bal
+        );
+        StrategyEngine::send_telegram_alert(&startup_msg).await;
     }
 
     // --- GRACEFUL SHUTDOWN ---
