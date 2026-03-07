@@ -346,12 +346,14 @@ impl StrategyEngine {
             self.state.save();
             
             if self.sign_and_submit(market, limit_price, size, Side::Buy).await {
-                // FIX: Only ban the market from re-buys if the API actually accepted the order!
                 self.traded_markets.insert(market.id.clone());
                 println!("[PROD] Buy Order Submitted: {}@${:.4}", size, limit_price);
                 let msg = format!("🎯 TRADE PLACED!\nAsset: {}\nPrice: ${:.4}\nWaiting for 5m settlement...", self.asset, limit_price);
                 Self::send_telegram_alert(&msg).await;
             } else {
+                eprintln!("[ERROR] Buy order failed for {} @ ${:.4} (size: {:.2})", self.asset, limit_price, size);
+                let msg = format!("❌ BUY FAILED\nAsset: {}\nPrice: ${:.4}\nSize: {:.2}\nOrder was not accepted.", self.asset, limit_price, size);
+                Self::send_telegram_alert(&msg).await;
                 self.state.reset();
             }
         } else {
@@ -377,7 +379,11 @@ impl StrategyEngine {
             self.state.state = BotState::PendingSell;
             self.state.pending_since = Utc::now().timestamp_millis() + (self.time_offset * 1000);
             self.state.save();
-            self.sign_and_submit(market, sell_price, size, Side::Sell).await;
+            if !self.sign_and_submit(market, sell_price, size, Side::Sell).await {
+                eprintln!("[ERROR] Emergency sell failed for {} @ ${:.4} (size: {:.2})", self.asset, sell_price, size);
+                let msg = format!("⚠️ EMERGENCY SELL FAILED\nAsset: {}\nPrice: ${:.4}\nSize: {:.2}\nWill retry via reconciliation.", self.asset, sell_price, size);
+                Self::send_telegram_alert(&msg).await;
+            }
         } else {
             let pnl = (sell_price - self.state.entry_price) * size;
             self.state.simulated_balance += pnl;
@@ -402,13 +408,22 @@ impl StrategyEngine {
                 .size(size_dec)
                 .side(side);
 
-            if let Ok(order) = order_builder.build().await {
-                if let Ok(signed_order) = client.sign(signer, order).await {
-                    if let Ok(resp) = client.post_order(signed_order).await {
-                        println!("[PROD] Order Submitted! ID: {:?}", resp.order_id);
-                        return true;
+            match order_builder.build().await {
+                Ok(order) => {
+                    match client.sign(signer, order).await {
+                        Ok(signed_order) => {
+                            match client.post_order(signed_order).await {
+                                Ok(resp) => {
+                                    println!("[PROD] Order Submitted! ID: {:?}", resp.order_id);
+                                    return true;
+                                }
+                                Err(e) => eprintln!("[ERROR] post_order failed: {}", e),
+                            }
+                        }
+                        Err(e) => eprintln!("[ERROR] sign failed: {}", e),
                     }
                 }
+                Err(e) => eprintln!("[ERROR] order build failed: {}", e),
             }
         }
         false
