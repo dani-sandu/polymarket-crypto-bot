@@ -51,6 +51,17 @@ impl PersistentState {
         Self::default()
     }
 
+    /// Reset the state machine to Idle, clearing position data.
+    /// Does NOT reset simulated_balance, vault, or cumulative_pnl.
+    pub fn reset(&mut self) {
+        self.state = BotState::Idle;
+        self.active_market_id = None;
+        self.entry_price = 0.0;
+        self.position_size = 0.0;
+        self.pending_since = 0;
+        self.save();
+    }
+
     pub fn save(&self) {
         if let Ok(json) = serde_json::to_string_pretty(self) {
             if let Err(e) = fs::write("state.json", json) {

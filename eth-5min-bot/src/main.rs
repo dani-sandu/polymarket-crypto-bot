@@ -172,7 +172,7 @@ async fn main() {
     let trading_enabled =
         env::var("TRADING_ENABLED").unwrap_or_else(|_| "false".to_string()) == "true";
 
-    let _private_key = env::var("PRIVATE_KEY").ok();
+    let _private_key = env::var("PRIVATE_KEY").ok().map(|s| s.trim().to_string());
     let signature_type = env::var("SIGNATURE_TYPE")
         .unwrap_or_else(|_| "0".to_string())
         .parse::<u8>()

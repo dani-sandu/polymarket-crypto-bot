@@ -1,22 +1,5 @@
 use serde::Deserialize;
 use std::collections::VecDeque;
-use std::time::Instant;
-
-#[derive(Debug, Deserialize)]
-struct BinanceKline(
-    i64,    // Open time
-    String, // Open
-    String, // High
-    String, // Low
-    String, // Close
-    String, // Volume
-    i64,    // Close time
-    String, // Quote asset volume
-    i64,    // Number of trades
-    String, // Taker buy base asset volume
-    String, // Taker buy quote asset volume
-    String, // Ignore
-);
 
 #[derive(Debug, Clone)]
 struct Candle {
@@ -96,9 +79,10 @@ impl AtrMonitor {
     }
 
     /// Updates the monitor with a new price tick
+    /// `current_timestamp` is in seconds (Unix epoch)
     pub fn update_from_tick(&mut self, current_price: f64, current_timestamp: i64) {
-        // Binance timestamps are in ms, but user requested i64 (assume ms for consistency)
-        let candle_timestamp = (current_timestamp / 300_000) * 300_000;
+        // Bucket into 5-minute (300s) candles
+        let candle_timestamp = (current_timestamp / 300) * 300;
 
         match &mut self.current_candle {
             Some(ref mut candle) if candle.timestamp == candle_timestamp => {

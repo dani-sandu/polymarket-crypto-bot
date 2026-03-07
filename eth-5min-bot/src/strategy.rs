@@ -442,7 +442,7 @@ impl StrategyEngine {
         let funder = self.funder.unwrap_or(Address::zero());
         if funder.is_zero() { return None; }
 
-        let usdc_address = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174".parse::<Address>().ok()?;
+        let usdc_address = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359".parse::<Address>().ok()?;
         let mut call_data = [0x70, 0xa0, 0x82, 0x31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0].to_vec();
         call_data.extend_from_slice(funder.as_bytes());
         
@@ -478,8 +478,21 @@ impl StrategyEngine {
     }
 
     pub async fn initialize_client(&mut self, private_key: &str) -> bool {
-        let signer = LocalSigner::from_str(private_key).unwrap().with_chain_id(Some(POLYGON));
-        let client_builder = ClobClient::new("https://clob.polymarket.com", ClobConfig::default()).unwrap();
+        let trimmed_key = private_key.trim();
+        let signer = match LocalSigner::from_str(trimmed_key) {
+            Ok(s) => s.with_chain_id(Some(POLYGON)),
+            Err(e) => {
+                eprintln!("[SDK] Invalid PRIVATE_KEY: {}. Check that it is a valid 64-char hex string.", e);
+                return false;
+            }
+        };
+        let client_builder = match ClobClient::new("https://clob.polymarket.com", ClobConfig::default()) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[SDK] Failed to create ClobClient: {}", e);
+                return false;
+            }
+        };
         
         let mut auth_builder = client_builder.authentication_builder(&signer);
         

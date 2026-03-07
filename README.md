@@ -1,117 +1,105 @@
-# PolyHFT: Institutional-Grade Polymarket Execution Engine
+# PolyHFT — Polymarket Crypto Trading Bot
 
 ![Rust](https://img.shields.io/badge/Built_With-Rust-orange?style=flat-square&logo=rust)
 ![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)
-![Status](https://img.shields.io/badge/Status-Production_Ready-green?style=flat-square)
 
-**PolyHFT** is a high-frequency, asynchronous trading engine designed for Polymarket's 5-minute crypto markets.
+A high-frequency trading bot for Polymarket's 5-minute crypto markets, built in Rust. Connects to Binance, Coinbase, and Polymarket WebSocket feeds for real-time price data and executes trades via the Polymarket CLOB SDK.
 
-This engine handles the "plumbing" so you can focus on the math. It solves the problems of market microstructure, state persistence, and RPC latency management out of the box.
+## Features
 
----
+- **Multi-asset support** — Separate bots for BTC and ETH 5-minute markets
+- **Real-time feeds** — Concurrent Binance, Coinbase, Deribit DVOL, and Polymarket WebSocket streams
+- **Risk management** — De-peg killswitch, velocity lockout, volatility desert detection, and drift reconciliation
+- **Telegram alerts** — Async execution receipts and PnL notifications
+- **Docker ready** — One command to build and deploy
+- **Simulation mode** — Paper trade with live data before going live
 
-## ⚡ Why This Engine Exists
+## Project Structure
 
-Ready to use polymarket bot built with rust. I wasn't able to find any open source polymarket bot built with rust, so I decided to build one for myself. It works with polymarket CLOB and uses binance and coinbase for price feeds. It also has a built in risk management system that prevents you from losing money. The bot was built for 5 minute crypto markets and is optimized for speed and accuracy.
-
-### 1. The Ultra-Low Latency Stack
-This engine is built to maximize the speed of the **Rust + AWS `eu-west-1` + Alchemy + Binance/Coinbase** pipeline. 
-- **Concurrent Execution:** Processes Binance, Coinbase, and Polymarket WebSocket streams simultaneously without thread blocking.
-- **Tick-to-Trade Speed:** Evaluates entry matrices in microseconds using `libm::erf`. The entire loop from price tick to Polygon signature executes in under 5ms.
-- **Memory Safety:** No garbage collection pauses.
-
-### 2. Private RPC & Colocation Ready
-- **Dedicated Nodes:** Native support for private Polygon RPC endpoints (Alchemy/QuickNode) via `.env` configuration. 
-- **AWS Optimized:** Designed to run headless via `tmux` on `eu-west-1` (Ireland) or `us-east-1` (N. Virginia), minimizing network hops to Polymarket's matching engine and centralized exchange APIs.
-
-### 3. Institutional Risk Management
-- **De-Peg Killswitch:** Automatically halts trading if Binance and Coinbase prices diverge by >0.15% (protects against oracle failure).
-- **Velocity Lockout:** Dynamic volatility monitoring prevents execution during "flash crash" candles where slippage is infinite.
-- **Volatility Desert:** Automatically idles during low-volume regimes to prevent fee churn.
-- **Drift Reconciliation:** A background loop that syncs local state with on-chain shares every 15s.
-
-### 4. Telemetry & Live Monitoring
-- **Real-Time Telegram Integration:** Built-in, asynchronous Telegram alerts. The bot fires off execution receipts, final PnL settlements, and killswitch warnings directly to your phone without blocking the main trading thread.
-
----
-
-## 🛠 Architecture
-
-The system is split into two binary crates for isolation:
-
-1.  **`btc-5min-bot` / `eth-5min-bot`**: The specialized strategy runners.
-2.  **`core_shared`**: The shared library handling WebSocket parsing, signing, and math.
-
-### The "Clean Room" Strategy
-This repository contains the **Execution Engine**. The proprietary entry/exit logic (Tiers 1, 2, and 3) has been scrubbed to provide a clean canvas for your strategy.
-
-**You are responsible for implementing the logic inside:**
-`src/strategy.rs` -> `execute_tick()`
-
-```rust
-// EXAMPLE SLOT FOR YOUR STRATEGY
-// The engine provides:
-// - gap: divergence from strike
-// - time_to_expiry: seconds left
-// - active_dvol: current volatility
-
-if gap > (binance_price * 0.005) && time_to_expiry <= 20 {
-    // The engine handles the signing, nonce management, and connection
-    self.execute_buy(market, mkt_price).await;
-}
+```
+├── btc-5min-bot/       # BTC 5-minute market bot
+│   └── src/
+│       ├── main.rs         # WebSocket feeds, market discovery, main loop
+│       ├── strategy.rs     # Entry/exit logic, order execution, SDK auth
+│       ├── state.rs        # Persistent state & PnL tracking
+│       ├── atr.rs          # ATR (Average True Range) monitor
+│       ├── velocity.rs     # Velocity lockout logic
+│       └── config.rs       # Market configuration
+├── eth-5min-bot/       # ETH 5-minute market bot (same structure)
+├── core-shared/        # Shared library (types, WebSocket parsing)
+├── docker-compose.yml
+├── Dockerfile
+└── .env.example
 ```
 
-🚀 Quick Start
-Prerequisites
+## Quick Start
 
-    Rust (Cargo)
+### Prerequisites
 
-    A Polygon RPC URL (Alchemy Private Node recommended)
+- [Rust](https://rustup.rs/) (for local builds) or Docker
+- Polygon RPC URL (Alchemy recommended)
+- Polymarket wallet with USDC.e on Polygon
 
-    A Polymarket Proxy Wallet (Relayer)
+### Setup
 
-Setup
+1. **Clone and configure**
 
-    Clone the Repo
-    Bash
+   ```bash
+   git clone https://github.com/TheOverLordEA/poly-hft-engine.git
+   cd poly-hft-engine
+   cp .env.example .env.btc   # and/or .env.eth
+   ```
 
-    git clone https://github.com/TheOverLordEA/poly-hft-engine.git
-    cd poly-hft-engine
+2. **Edit `.env.btc`** with your credentials:
 
-    Configure Environment
-    Create a .env file in the bot directory:
-    Bash
+   ```env
+   PRIVATE_KEY=0xYourPrivateKey
+   POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY
+   POLYMARKET_WS_URL=wss://ws-subscriptions-clob.polymarket.com/ws/market
+   TRADING_ENABLED=true
+   ```
 
-    PRIVATE_KEY=your_polygon_private_key
-    POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY
-    TELEGRAM_BOT_TOKEN=optional_for_alerts
-    TELEGRAM_CHAT_ID=optional_for_alerts
+   See [.env.example](.env.example) for all options (Telegram alerts, funder address, signature type, etc).
 
-    Safe Testing Logic
-    The engine comes with built-in testing modes so you don't burn capital while tuning your strategy:
+3. **Run with Docker** (recommended)
 
-        Ghost Test: Run run_ghost_test() to verify your API keys and proxy wallet connection by firing a $0.10 order and instantly cancelling it.
+   ```bash
+   docker compose up btc-5min-bot -d --build
+   docker compose logs btc-5min-bot -f          # watch logs
+   ```
 
-        Simulation Mode: Set TRADING_ENABLED=false when starting the bot. It will track real-time WebSocket data, simulate fills, and output simulated PnL to the terminal and Telegram without signing live transactions.
+   Or run locally:
 
-    Build & Run
-    Bash
+   ```bash
+   cargo build --release
+   ./target/release/btc-5min-bot
+   ```
 
-    cargo build --release
-    TRADING_ENABLED=true ./target/release/eth-5min-bot
+### Testing Safely
 
-💼 Consulting & Custom Integration
+- **Simulation mode** — Set `TRADING_ENABLED=false`. The bot tracks live data and simulates fills without signing transactions.
+- **Ghost test** — Set `RUN_GHOST_TEST=true` to verify API keys and proxy wallet by placing and cancelling a $0.10 order.
+- **Permission setup** — Set `SETUP_PERMISSIONS=true` to grant the required `setApprovalForAll` for selling shares.
 
-"I have the strategy, but I don't know Rust."
+## Strategy
 
-I built this engine. I know every line of the async loop, the WebSocket parsers, and the chain reconciliation logic.
+The entry/exit logic lives in `strategy.rs` → `execute_tick()`. The engine provides:
 
-If want a custom implementation with your strategy and vps:
+- `gap` — price divergence from strike
+- `time_to_expiry` — seconds remaining
+- `active_dvol` — current implied volatility
+- Binance/Coinbase prices, Polymarket orderbook spread
 
-   I can implement your proprietary strategy into this engine securely.
+## Environment Variables
 
-   I can help you with deploy & colocate your bot on AWS eu-west-1 or us-east-1 for maximum speed.
-
-   I can help you with optimize the fee/spread math for your specific capital size
-
-[Contact Me via DM] or open an Issue titled "Consulting Request".
+| Variable | Required | Description |
+|---|---|---|
+| `PRIVATE_KEY` | Yes | Polygon wallet private key |
+| `POLYGON_RPC_URL` | Yes | Polygon RPC endpoint |
+| `POLYMARKET_WS_URL` | Yes | Polymarket WebSocket URL |
+| `TRADING_ENABLED` | No | `true` for live trading (default: `false`) |
+| `MARKET_ASSET` | No | `btc` or `eth` (default: `btc`) |
+| `SIGNATURE_TYPE` | No | `0` (EOA) or `2` (Gnosis Safe) |
+| `FUNDER_ADDRESS` | No | Proxy/Safe address if using `SIGNATURE_TYPE=2` |
+| `TELEGRAM_BOT_TOKEN` | No | Telegram bot token for alerts |
+| `TELEGRAM_CHAT_ID` | No | Telegram chat ID for alerts |

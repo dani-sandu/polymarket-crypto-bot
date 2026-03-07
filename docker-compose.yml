@@ -1,9 +1,38 @@
-version: '3.8'
-
 services:
-  crypto-bot:
-    build: .
-    volumes:
-      - ./config:/app/config
+  btc-5min-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: btc-5min-bot
+    restart: unless-stopped
     env_file:
-      - ./config/.env
+      - .env.btc
+    environment:
+      - RUST_LOG=info
+      - MARKET_ASSET=btc
+      - DOCKER_ENV=true
+    command: ["./btc-5min-bot"]
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    volumes:
+      - btc-bot-data:/app/data
+
+  eth-5min-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: eth-5min-bot
+    restart: unless-stopped
+    env_file:
+      - .env.eth
+    environment:
+      - RUST_LOG=info
+      - MARKET_ASSET=eth
+    command: ["./eth-5min-bot"]
+    volumes:
+      - eth-bot-data:/app/data
+
+volumes:
+  btc-bot-data:
+  eth-bot-data:

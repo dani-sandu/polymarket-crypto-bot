@@ -1,6 +1,7 @@
 # Environments
 .env
-.env.*
+.env.btc
+.env.eth
 
 # Rust
 target/

@@ -9,6 +9,7 @@ use polymarket_client_sdk::POLYGON;
 use alloy_signer_local::LocalSigner;
 use k256::ecdsa::SigningKey;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::collections::HashMap;
 use std::env;
 use chrono::Utc;
@@ -29,6 +30,10 @@ pub struct StrategyEngine {
     // Auth / SDK
     pub client: Option<ClobClient<Authenticated<Normal>>>,
     pub signer_instance: Option<LocalSigner<SigningKey>>,
+    
+    // Shared HTTP clients (reused across calls)
+    pub http_client: reqwest::Client,
+    pub rpc_provider: Option<Provider<Http>>,
     
     // Risk & Loop Counters
     pub atr: AtrMonitor,
@@ -63,6 +68,11 @@ impl StrategyEngine {
         let atr = AtrMonitor::new().await;
         let velocity = VelocityLockout::new(30.0, 2);
 
+        let http_client = reqwest::Client::new();
+        let rpc_provider = env::var("POLYGON_RPC_URL")
+            .ok()
+            .and_then(|url| Provider::<Http>::try_from(url).ok());
+
         Self {
             trading_enabled,
             asset,
@@ -71,6 +81,8 @@ impl StrategyEngine {
             time_offset,
             client: None,
             signer_instance: None,
+            http_client,
+            rpc_provider,
             atr,
             velocity,
             state,
@@ -93,10 +105,9 @@ impl StrategyEngine {
         if token.is_empty() || chat_id.is_empty() { return; }
 
         let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
-        let client = reqwest::Client::new();
         
         // Fire and forget (won't slow down the bot)
-        let _ = client.post(&url)
+        let _ = reqwest::Client::new().post(&url)
             .form(&[("chat_id", &chat_id), ("text", &message.to_string())])
             .send()
             .await;
@@ -180,11 +191,7 @@ impl StrategyEngine {
                         }
                         
                         // 4. Force State Machine Reset
-                        self.state.state = BotState::Idle;
-                        self.state.position_size = 0.0;
-                        self.state.entry_price = 0.0;
-                        self.state.active_market_id = None;
-                        self.state.save();
+                        self.state.reset();
                         return;
                     }
                 }
@@ -194,45 +201,96 @@ impl StrategyEngine {
         self.atr.update_from_tick(binance_price, now_ms / 1000);
         self.velocity.update(binance_price);
 
-        // 3. ENTRY MATRIX
+        // 3. ENTRY MATRIX — Probability-Edge Strategy
+        //
+        // Overview:
+        //   1. Compute the theoretical probability that BTC finishes above the strike
+        //      using a normal-CDF model with ATR-adjusted volatility.
+        //   2. Derive the fair value for the UP and DOWN tokens.
+        //   3. Compare fair value to the Polymarket price — the difference is our "edge".
+        //   4. Use the gap tiers from MarketConfig to set the minimum edge required:
+        //      - Tier 1 (gap >= 180): high conviction, accept edge >= 4%
+        //      - Tier 2 (gap >= 120): medium conviction, require edge >= 7%
+        //      - Tier 3 (gap >= 80):  low conviction, require edge >= 12%
+        //      - Below Tier 3: skip — not enough directional signal.
+        //   5. Only buy the token whose direction is favored (UP if price > strike, DOWN otherwise).
+        //
         if self.state.state == BotState::Idle {
+            let current_atr = self.atr.current_atr();
+
             for market in markets.values() {
-                if self.traded_markets.contains(&market.id) { continue; } // Prevent re-buying a closed market
+                if self.traded_markets.contains(&market.id) { continue; }
                 let time_to_expiry = market.expiration - (now_ms / 1000);
-                if time_to_expiry <= 4 || time_to_expiry > 20 { continue; } // 4s Dead Zone
+                if time_to_expiry <= 4 || time_to_expiry > 20 { continue; }
                 if self.velocity.is_locked() { continue; }
 
                 let mkt_price = market.last_price;
                 if mkt_price < 0.01 || mkt_price > 0.99 { continue; }
 
-                // The true gap is distance from Strike
                 let gap = (binance_price - market.strike_price).abs();
-                
-                // Macro Filter Adjustments
-                let mut spread = 0.0;
-                let mut mkt_price = 0.0;
-                if let Some(m) = markets.get(&market.id) {
-                    let bid = m.orderbook.best_bid().unwrap_or(0.0);
-                    let ask = m.orderbook.best_ask().unwrap_or(1.0);
-                    spread = (ask - bid).abs();
-                    mkt_price = m.last_price;
-                }
 
-                if spread > config.max_spread { return; } // Max Spread Filter
+                // Compute spread from the orderbook
+                let bid = market.orderbook.best_bid().unwrap_or(0.0);
+                let ask = market.orderbook.best_ask().unwrap_or(1.0);
+                let spread = (ask - bid).abs();
+                if spread > config.max_spread { continue; }
 
-                // --- INSERT YOUR STRATEGY HERE ---
-                // The engine provides:
-                // - gap: distance from strike price
-                // - time_to_expiry: seconds until settlement
-                // - active_dvol: current market volatility
-                // - mkt_price: current Polymarket price
+                // --- Determine minimum edge required based on gap tier ---
+                let min_edge = if gap >= config.tier_1_gap {
+                    0.04 // Tier 1: strong directional move, accept 4% edge
+                } else if gap >= config.tier_2_gap {
+                    0.07 // Tier 2: moderate move, need 7% edge
+                } else if gap >= config.tier_3_gap {
+                    0.12 // Tier 3: small move, need 12% edge
+                } else {
+                    continue; // Gap too small — no directional conviction
+                };
 
-                if gap > (binance_price * 0.005) && time_to_expiry <= 20 {
-                    // Example entry: Buy if price is significantly divergent from strike
-                    self.execute_buy(market, mkt_price).await;
+                // --- Calculate theoretical fair value ---
+                // P(UP wins) = probability BTC finishes above strike
+                let p_up = Self::calculate_probability(
+                    binance_price,
+                    market.strike_price,
+                    time_to_expiry,
+                    current_atr,
+                );
+
+                // Fair value for this specific token direction
+                let fair_value = match market.direction {
+                    TokenDirection::Up   => p_up,
+                    TokenDirection::Down => 1.0 - p_up,
+                };
+
+                // --- Edge = how much cheaper the market is vs fair value ---
+                let edge = fair_value - mkt_price;
+
+                // --- Cross-exchange confirmation ---
+                // Require Coinbase to agree on direction (if available)
+                let coinbase_confirms = if coinbase_price > 0.0 {
+                    match market.direction {
+                        TokenDirection::Up   => coinbase_price > market.strike_price,
+                        TokenDirection::Down => coinbase_price <= market.strike_price,
+                    }
+                } else {
+                    true // No Coinbase data — don't block
+                };
+
+                if edge >= min_edge && fair_value > 0.60 && coinbase_confirms {
+                    // Buy at the best ask (or mkt_price as a limit)
+                    let buy_price = ask.min(mkt_price + 0.01); // Aggressive but capped
+                    println!(
+                        "[STRATEGY] {} | Gap ${:.0} (Tier {}) | Fair {:.2} vs Mkt {:.2} | Edge {:.1}% | TTE {}s",
+                        if market.direction == TokenDirection::Up { "UP" } else { "DOWN" },
+                        gap,
+                        if gap >= config.tier_1_gap { 1 } else if gap >= config.tier_2_gap { 2 } else { 3 },
+                        fair_value,
+                        mkt_price,
+                        edge * 100.0,
+                        time_to_expiry
+                    );
+                    self.execute_buy(market, buy_price).await;
                     break;
                 }
-
             }
         }
 
@@ -260,13 +318,17 @@ impl StrategyEngine {
         }
     }
 
-    pub fn calculate_probability(current_price: f64, strike_price: f64, time_remaining_sec: i64) -> f64 {
+    pub fn calculate_probability(current_price: f64, strike_price: f64, time_remaining_sec: i64, atr: f64) -> f64 {
         if time_remaining_sec <= 0 {
             return if current_price > strike_price { 1.0 } else { 0.0 };
         }
         let distance = current_price - strike_price;
-        let volatility_per_sec = 9.0;
+        // Use ATR-derived per-second volatility instead of a hardcoded constant.
+        // ATR is over 5-min candles (300s). Scale to per-second: ATR / sqrt(300).
+        // Fallback to 9.0 if ATR is unreasonable.
+        let volatility_per_sec = if atr > 1.0 { atr / (300.0_f64).sqrt() } else { 9.0 };
         let sigma = volatility_per_sec * (time_remaining_sec as f64).sqrt();
+        if sigma < 1e-9 { return if distance > 0.0 { 1.0 } else { 0.0 }; }
         let z_score = distance / sigma;
         0.5 * (1.0 + libm::erf(z_score / std::f64::consts::SQRT_2))
     }
@@ -290,12 +352,7 @@ impl StrategyEngine {
                 let msg = format!("🎯 TRADE PLACED!\nAsset: {}\nPrice: ${:.4}\nWaiting for 5m settlement...", self.asset, limit_price);
                 Self::send_telegram_alert(&msg).await;
             } else {
-                self.state.state = BotState::Idle;
-                self.state.active_market_id = None;
-                self.state.pending_since = 0;
-                self.state.entry_price = 0.0;
-                self.state.position_size = 0.0;
-                self.state.save();
+                self.state.reset();
             }
         } else {
             self.state.state = BotState::InPosition;
@@ -324,10 +381,7 @@ impl StrategyEngine {
         } else {
             let pnl = (sell_price - self.state.entry_price) * size;
             self.state.simulated_balance += pnl;
-            self.state.state = BotState::Idle;
-            self.state.position_size = 0.0;
-            self.state.active_market_id = None;
-            self.state.save();
+            self.state.reset();
             println!("[SIM] Emergency exit at ${:.4}", sell_price);
         }
     }
@@ -391,24 +445,14 @@ impl StrategyEngine {
                                 self.state.save();
                             } else if now_ms - self.state.pending_since > 5000 {
                                 println!("[RECON] Buy failed/timeout. Reverting to Idle.");
-                                self.state.state = BotState::Idle;
-                                self.state.active_market_id = None;
-                                self.state.entry_price = 0.0;
-                                self.state.position_size = 0.0;
-                                self.state.pending_since = 0;
-                                self.state.save();
+                                self.state.reset();
                             }
                         } else if self.state.state == BotState::PendingSell {
                             if on_chain_shares < 0.01 {
                                 println!("[RECON] Sell confirmed on-chain.");
                                 let msg = format!("✅ WINNER!\nSuccessfully sold position.\nBalance is now: ${:.2}", self.state.simulated_balance);
                                 Self::send_telegram_alert(&msg).await;
-                                self.state.state = BotState::Idle;
-                                self.state.active_market_id = None;
-                                self.state.entry_price = 0.0;
-                                self.state.position_size = 0.0;
-                                self.state.pending_since = 0;
-                                self.state.save();
+                                self.state.reset();
                             } else if now_ms - self.state.pending_since > 5000 {
                                 println!("[RECON] Sell failed/timeout. Reverting to InPosition.");
                                 self.state.state = BotState::InPosition;
@@ -421,14 +465,11 @@ impl StrategyEngine {
                             println!("[RECON] Share drift detected. Engine: {:.2}, Chain: {:.2}", self.state.position_size, on_chain_shares);
                             self.state.position_size = on_chain_shares;
                             if on_chain_shares < 0.01 {
-                                self.state.state = BotState::Idle;
-                                self.state.active_market_id = None;
-                                self.state.entry_price = 0.0;
-                                self.state.pending_since = 0;
+                                self.state.reset();
                             } else {
                                 self.state.state = BotState::InPosition;
+                                self.state.save();
                             }
-                            self.state.save();
                         }
                     }
                 }
@@ -437,12 +478,11 @@ impl StrategyEngine {
     }
 
     async fn check_usdc_balance(&self) -> Option<f64> {
-        let rpc_url = env::var("POLYGON_RPC_URL").ok()?;
-        let provider = Provider::<Http>::try_from(rpc_url).ok()?;
+        let provider = self.rpc_provider.as_ref()?;
         let funder = self.funder.unwrap_or(Address::zero());
         if funder.is_zero() { return None; }
 
-        let usdc_address = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174".parse::<Address>().ok()?;
+        let usdc_address = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359".parse::<Address>().ok()?;
         let mut call_data = [0x70, 0xa0, 0x82, 0x31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0].to_vec();
         call_data.extend_from_slice(funder.as_bytes());
         
@@ -454,8 +494,7 @@ impl StrategyEngine {
     }
 
     async fn check_on_chain_position(&self, market: &Market) -> Option<f64> {
-        let rpc_url = env::var("POLYGON_RPC_URL").ok()?;
-        let provider = Provider::<Http>::try_from(rpc_url).ok()?;
+        let provider = self.rpc_provider.as_ref()?;
         let funder = self.funder.unwrap_or(Address::zero());
         if funder.is_zero() { return None; }
 
@@ -478,8 +517,21 @@ impl StrategyEngine {
     }
 
     pub async fn initialize_client(&mut self, private_key: &str) -> bool {
-        let signer = LocalSigner::from_str(private_key).unwrap().with_chain_id(Some(POLYGON));
-        let client_builder = ClobClient::new("https://clob.polymarket.com", ClobConfig::default()).unwrap();
+        let trimmed_key = private_key.trim();
+        let signer = match LocalSigner::from_str(trimmed_key) {
+            Ok(s) => s.with_chain_id(Some(POLYGON)),
+            Err(e) => {
+                eprintln!("[SDK] Invalid PRIVATE_KEY: {}. Check that it is a valid 64-char hex string.", e);
+                return false;
+            }
+        };
+        let client_builder = match ClobClient::new("https://clob.polymarket.com", ClobConfig::default()) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[SDK] Failed to create ClobClient: {}", e);
+                return false;
+            }
+        };
         
         let mut auth_builder = client_builder.authentication_builder(&signer);
         
@@ -508,18 +560,11 @@ impl StrategyEngine {
         let rpc_url = std::env::var("POLYGON_RPC_URL").expect("Missing POLYGON_RPC_URL");
         let priv_key = std::env::var("PRIVATE_KEY").expect("Missing PRIVATE_KEY");
 
-        // One-time leak for the setup script to satisfy 'static bounds in async block
-        let rpc_url_static: &'static str = Box::leak(rpc_url.into_boxed_str());
-        let priv_key_static: &'static str = Box::leak(priv_key.into_boxed_str());
-
-        let provider = Provider::<Http>::try_from(rpc_url_static).unwrap();
-        let wallet = priv_key_static.parse::<LocalWallet>().unwrap().with_chain_id(137u64);
+        let provider = Provider::<Http>::try_from(rpc_url.as_str()).unwrap();
+        let wallet = priv_key.parse::<LocalWallet>().unwrap().with_chain_id(137u64);
         
-        // 2. Capture address
         let my_address = wallet.address();
-        
-        // 3. Move wallet into client
-        let client = Box::leak(Box::new(SignerMiddleware::new(provider, wallet)));
+        let client = std::sync::Arc::new(SignerMiddleware::new(provider, wallet));
 
         let ctf_address = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045".parse::<Address>().unwrap();
         let operator_address = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E".parse::<Address>().unwrap();
@@ -537,9 +582,16 @@ impl StrategyEngine {
             .data(data)
             .from(my_address); 
         
-        match client.send_transaction(tx, None).await {
-            Ok(pending_tx) => {
-                println!("[SUCCESS] Permission Transaction Sent: {:?}", pending_tx.tx_hash());
+        // Extract tx_hash immediately so PendingTransaction (which borrows client) is dropped
+        let tx_result = client.send_transaction(tx, None).await
+            .map(|pending_tx| {
+                let hash = pending_tx.tx_hash();
+                hash
+            });
+
+        match tx_result {
+            Ok(hash) => {
+                println!("[SUCCESS] Permission Transaction Sent: {:?}", hash);
                 true
             }
             Err(e) => {

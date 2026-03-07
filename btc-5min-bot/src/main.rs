@@ -2,7 +2,7 @@ use ethers::prelude::*;
 use ethers::signers::Signer as _;
 use core_shared::{Market, TokenDirection};
 use chrono::{Utc, DateTime, Timelike};
-use dotenv::dotenv;
+use dotenv;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::env;
@@ -129,15 +129,32 @@ async fn fetch_server_time() -> Result<i64, Box<dyn std::error::Error + Send + S
 
 #[tokio::main]
 async fn main() {
-    dotenv().ok();
+    // Load .env.btc for consistency with docker-compose naming
+    match dotenv::from_filename(".env.btc") {
+        Ok(path) => println!("[ENV] Loaded .env.btc from {:?}", path),
+        Err(_) => {
+            // Fallback to .env for backwards compatibility
+            if dotenv::dotenv().is_ok() {
+                println!("[ENV] Loaded .env (fallback)");
+            } else {
+                println!("[ENV] No .env file found, using environment variables");
+            }
+        }
+    }
     let market_config = MarketConfig::default_btc();
 
     // --- SINGLETON LOCK GUARD ---
-    let lock_file = ".bot.lock";
+    let lock_file = ".btc-bot.lock";
     if fs::metadata(lock_file).is_ok() {
-        eprintln!("[CRITICAL] LOCK FILE DETECTED ({}). ANOTHER BOT IS RUNNING OR CRASHED.", lock_file);
-        eprintln!("To force start: rm {}", lock_file);
-        std::process::exit(1);
+        // In Docker, a stale lock file means the previous run crashed. Auto-clean it.
+        if env::var("DOCKER_ENV").is_ok() || env::var("container").is_ok() {
+            eprintln!("[WARN] Stale lock file detected. Auto-removing (Docker environment).");
+            let _ = fs::remove_file(lock_file);
+        } else {
+            eprintln!("[CRITICAL] LOCK FILE DETECTED ({}). ANOTHER BOT IS RUNNING OR CRASHED.", lock_file);
+            eprintln!("To force start: rm {}", lock_file);
+            std::process::exit(1);
+        }
     }
     let _ = fs::write(lock_file, Utc::now().to_rfc3339());
     env_logger::init();
@@ -167,7 +184,7 @@ async fn main() {
     let trading_enabled =
         env::var("TRADING_ENABLED").unwrap_or_else(|_| "false".to_string()) == "true";
 
-    let _private_key = env::var("PRIVATE_KEY").ok();
+    let _private_key = env::var("PRIVATE_KEY").ok().map(|s| s.trim().to_string());
     let signature_type = env::var("SIGNATURE_TYPE")
         .unwrap_or_else(|_| "0".to_string())
         .parse::<u8>()
@@ -188,10 +205,10 @@ async fn main() {
 
     // --- ZOMBIE KILLER: Kill any other running instances of the bot ---
     if trading_enabled {
-        println!("[SAFETY] Ensuring no duplicate bits are running (pkill)...");
+        println!("[SAFETY] Ensuring no duplicate bots are running (pkill)...");
         let _ = std::process::Command::new("sh")
             .arg("-c")
-            .arg("pkill -9 poly_rust_bot")
+            .arg("pkill -9 btc-5min-bot")
             .spawn();
         sleep(Duration::from_millis(500)).await;
     }
@@ -206,9 +223,18 @@ async fn main() {
     // --- BINANCE WS TASK (Primary) ---
     let binance_ws_url_clone = binance_ws_url.clone();
     tokio::spawn(async move {
+        let mut backoff = 1u64;
         loop {
-            match connect_async(Url::parse(&binance_ws_url_clone).unwrap()).await {
+            let url = match Url::parse(&binance_ws_url_clone) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("[FEED] Invalid Binance WS URL: {}. Aborting task.", e);
+                    return;
+                }
+            };
+            match connect_async(url).await {
                 Ok((ws_stream, _)) => {
+                    backoff = 1; // Reset on successful connection
                     println!("[FEED] Connected to Binance WS");
                     let (_, mut read) = ws_stream.split();
                     while let Some(msg) = read.next().await {
@@ -222,10 +248,13 @@ async fn main() {
                             }
                         }
                     }
+                    // Stream ended (server closed) — reconnect immediately
+                    eprintln!("[FEED] Binance WS stream ended. Reconnecting...");
                 }
                 Err(e) => {
-                    eprintln!("[FEED] Binance WS Error: {}. Reconnecting...", e);
-                    sleep(Duration::from_secs(5)).await;
+                    eprintln!("[FEED] Binance WS Error: {}. Reconnecting in {}s...", e, backoff);
+                    sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(60);
                 }
             }
         }
@@ -235,9 +264,18 @@ async fn main() {
     let coinbase_ws_url = env::var("COINBASE_WS_URL")
         .unwrap_or_else(|_| "wss://ws-feed.exchange.coinbase.com".to_string());
     tokio::spawn(async move {
+        let mut backoff = 1u64;
         loop {
-            match connect_async(Url::parse(&coinbase_ws_url).unwrap()).await {
+            let url = match Url::parse(&coinbase_ws_url) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("[FEED] Invalid Coinbase WS URL: {}. Aborting task.", e);
+                    return;
+                }
+            };
+            match connect_async(url).await {
                 Ok((mut ws_stream, _)) => {
+                    backoff = 1;
                     println!("[FEED] Connected to Coinbase WS");
                     let sub = serde_json::json!({
                         "type": "subscribe",
@@ -257,10 +295,12 @@ async fn main() {
                             }
                         }
                     }
+                    eprintln!("[FEED] Coinbase WS stream ended. Reconnecting...");
                 }
                 Err(e) => {
-                    eprintln!("[FEED] Coinbase WS Error: {}. Reconnecting...", e);
-                    sleep(Duration::from_secs(5)).await;
+                    eprintln!("[FEED] Coinbase WS Error: {}. Reconnecting in {}s...", e, backoff);
+                    sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(60);
                 }
             }
         }
@@ -268,9 +308,11 @@ async fn main() {
 
     // --- DERIBIT DVOL TASK (Macro Filter) ---
     tokio::spawn(async move {
+        let mut backoff = 1u64;
         loop {
             match connect_async(Url::parse("wss://www.deribit.com/ws/api/v2").unwrap()).await {
                 Ok((mut ws_stream, _)) => {
+                    backoff = 1;
                     println!("[FEED] Connected to Deribit DVOL WS");
                     let subscribe_msg = serde_json::json!({
                         "jsonrpc": "2.0",
@@ -294,10 +336,12 @@ async fn main() {
                             }
                         }
                     }
+                    eprintln!("[FEED] Deribit WS stream ended. Reconnecting...");
                 }
                 Err(e) => {
-                    eprintln!("[FEED] Deribit WS Error: {}. Reconnecting...", e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    eprintln!("[FEED] Deribit WS Error: {}. Reconnecting in {}s...", e, backoff);
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(60);
                 }
             }
         }
@@ -307,6 +351,7 @@ async fn main() {
     let polymarket_ws_url_clone = polymarket_ws_url.clone();
     let market_asset_clone = market_asset.clone();
     tokio::spawn(async move {
+        let mut backoff = 1u64;
         loop {
             let (up_id, down_id, exp, strike, initial_price);
             match fetch_active_market_id(&market_asset_clone).await {
@@ -315,14 +360,23 @@ async fn main() {
                     let _ = market_id_tx.send(Some(up_id.clone()));
                 }
                 Err(e) => {
-                    eprintln!("[FEED] Polymarket meta error: {}. Retrying...", e);
-                    sleep(Duration::from_secs(5)).await;
+                    eprintln!("[FEED] Polymarket meta error: {}. Retrying in {}s...", e, backoff);
+                    sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(60);
                     continue;
                 }
             }
 
-            match connect_async(Url::parse(&polymarket_ws_url_clone).unwrap()).await {
+            let url = match Url::parse(&polymarket_ws_url_clone) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("[FEED] Invalid Polymarket WS URL: {}. Aborting task.", e);
+                    return;
+                }
+            };
+            match connect_async(url).await {
                 Ok((mut ws_stream, _)) => {
+                    backoff = 1;
                     println!("[FEED] Connected to Polymarket WS");
                     let sub = serde_json::json!({"assets_ids": [up_id, down_id], "type": "market"});
                     let _ = ws_stream.send(Message::Text(sub.to_string())).await;
@@ -368,8 +422,9 @@ async fn main() {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[FEED] Polymarket WS error: {}. Reconnecting...", e);
-                    sleep(Duration::from_secs(5)).await;
+                    eprintln!("[FEED] Polymarket WS error: {}. Reconnecting in {}s...", e, backoff);
+                    sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(60);
                 }
             }
         }
@@ -407,6 +462,7 @@ async fn main() {
                     let usdc_address = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174".parse::<Address>().unwrap();
                     
                     let target_addr = funder_address.unwrap_or(client_middleware.address());
+                    println!("[AUTH] Checking USDC.e balance for address: {:?}", target_addr);
                     
                     // Call USDC balanceOf
                     let data = [
@@ -463,7 +519,7 @@ async fn main() {
     // --- GRACEFUL SHUTDOWN ---
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
 
-    println!("[SNIPER] High-Frequency Loop Active. Priority: 1ms.");
+    println!("[SNIPER] High-Frequency Loop Active. Priority: 50ms.");
 
     tokio::select! {
         _ = async {
@@ -472,7 +528,7 @@ async fn main() {
                 let b_price = *strategy.binance_rx.borrow();
                 let c_price = *strategy.coinbase_rx.borrow();
                 strategy.execute_tick(b_price, c_price, &market_config).await;
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         } => {},
         _ = tokio::signal::ctrl_c() => {
@@ -485,5 +541,5 @@ async fn main() {
         }
     }
 
-    let _ = fs::remove_file(".bot.lock");
+    let _ = fs::remove_file(".btc-bot.lock");
 }
