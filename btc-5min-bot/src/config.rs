@@ -11,11 +11,11 @@ impl MarketConfig {
     pub fn default_btc() -> Self {
         Self {
             ticker: "BTC".to_string(),
-            tier_1_gap: 180.0,
-            tier_2_gap: 120.0,
-            tier_3_gap: 80.0,
-            killswitch_threshold: 50.0,
-            max_spread: 0.05,
+            tier_1_gap: 150.0,
+            tier_2_gap: 100.0,
+            tier_3_gap: 50.0,
+            killswitch_threshold: 75.0,
+            max_spread: 0.10,
         }
     }
 }
